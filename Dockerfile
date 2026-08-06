@@ -1,9 +1,9 @@
 # Step 1: Build the Next.js frontend
 FROM node:20-alpine AS frontend-builder
-WORKDIR /app
+WORKDIR /app/frontend
 
-# Copy package files and install dependencies
-COPY frontend/package*.json ./
+# Explicitly copy the package.json without globs to prevent Docker context errors
+COPY frontend/package.json ./
 RUN npm install
 
 # Copy frontend source code and build
@@ -12,7 +12,7 @@ RUN npm run build
 
 # Step 2: Build the FastAPI backend and serve everything
 FROM python:3.10-slim
-WORKDIR /app
+WORKDIR /app/backend
 
 # Install system dependencies (required for some Python packages like catboost)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,13 +24,13 @@ COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the backend code
-COPY backend/ ./backend/
+COPY backend/ ./
 
 # Copy the statically exported Next.js files into the backend's static directory
-COPY --from=frontend-builder /app/out /app/backend/static
+COPY --from=frontend-builder /app/frontend/out ./static
 
 # Expose the port Railway provides
 EXPOSE $PORT
 
 # Start FastAPI server, passing the Railway PORT dynamically
-CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
