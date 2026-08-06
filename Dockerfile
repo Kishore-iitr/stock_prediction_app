@@ -14,11 +14,6 @@ RUN npm run build
 FROM python:3.10-slim
 WORKDIR /app/backend
 
-# Install system dependencies (required for some Python packages like catboost)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install python dependencies
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
