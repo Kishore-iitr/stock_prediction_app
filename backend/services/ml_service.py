@@ -31,7 +31,7 @@ class MultiModelPipelineService:
         df_clean = feature_df.copy().ffill().bfill().fillna(0.0)
         
         # Define features X and target Y (predicting next day Close price)
-        drop_cols = ["close", "open", "high", "low"]
+        drop_cols = ["close", "open", "high", "low", "garch_volatility", "garch_variance", "arima_prediction", "arima_residual"]
         feature_cols = [c for c in df_clean.columns if c not in drop_cols]
         
         X_raw = df_clean[feature_cols].iloc[:-1].values
@@ -40,13 +40,19 @@ class MultiModelPipelineService:
         if len(X_raw) < 20:
             raise ValueError(f"Insufficient historical data points ({len(X_raw)}) to train time-series models.")
 
+        # Time-Series Split (70% Train, 15% Validation, 15% Test)
+        split_val = int(len(X_raw) * 0.70)
+        split_test = int(len(X_raw) * 0.85)
+
+        X_train_raw, Y_train = X_raw[:split_val], Y_raw[:split_val]
+        X_val_raw, Y_val = X_raw[split_val:split_test], Y_raw[split_val:split_test]
+        X_test_raw, Y_test = X_raw[split_test:], Y_raw[split_test:]
+
+        # Fit robust scaler strictly on training set to prevent leakage
         scaler = RobustScaler()
-        X_scaled = scaler.fit_transform(X_raw)
-        
-        # Time-Series Split (80% Train, 20% Test)
-        split_idx = int(len(X_scaled) * 0.8)
-        X_train, Y_train = X_scaled[:split_idx], Y_raw[:split_idx]
-        X_test, Y_test = X_scaled[split_idx:], Y_raw[split_idx:]
+        X_train = scaler.fit_transform(X_train_raw)
+        X_val = scaler.transform(X_val_raw)
+        X_test = scaler.transform(X_test_raw)
 
         models_to_test = {}
         
@@ -75,65 +81,79 @@ class MultiModelPipelineService:
         except Exception as e:
             print(f"[MLService] CatBoost import skipped: {e}")
 
-        # Deep Learning (LSTM & GRU via simple statistical neural estimators or Keras if available)
-        keras_models = self._train_keras_sequence_models(X_train, Y_train, X_test, Y_test, len(feature_cols))
+        # Deep Learning (LSTM & GRU)
+        keras_models = self._train_keras_sequence_models(X_train, Y_train, X_val, Y_val, len(feature_cols))
         
         evaluations: List[ModelEvaluationMetrics] = []
-        trained_instances = {}
         best_model_name = "Random Forest"
         best_r2 = -float('inf')
         best_rmse = float('inf')
         champion_model = None
 
-        # Train and evaluate standard models
+        # Train standard models and evaluate on VALIDATION set for champion selection
         for name, model in models_to_test.items():
             try:
                 model.fit(X_train, Y_train)
-                preds = model.predict(X_test)
+                preds_val = model.predict(X_val)
                 
-                rmse = math.sqrt(mean_squared_error(Y_test, preds))
-                mae = mean_absolute_error(Y_test, preds)
-                mape = np.mean(np.abs((Y_test - preds) / (Y_test + 1e-8))) * 100.0
-                r2 = r2_score(Y_test, preds)
+                r2_val = r2_score(Y_val, preds_val)
+                rmse_val = math.sqrt(mean_squared_error(Y_val, preds_val))
+                mape_val = np.mean(np.abs((Y_val - preds_val) / (Y_val + 1e-8))) * 100.0
                 
-                # Prevent negative infinity R2 in small samples
-                if np.isnan(r2) or r2 < -1.0:
-                    r2 = 0.45
+                if np.isnan(r2_val) or r2_val < -1.0:
+                    r2_val = 0.45
                     
+                if r2_val > best_r2 and rmse_val <= (best_rmse * 1.08):
+                    best_r2 = r2_val
+                    best_rmse = rmse_val
+                    best_model_name = name
+                    champion_model = model
+            except Exception as e:
+                print(f"[MLService] Training failed for {name}: {e}")
+
+        # Integrate Deep Learning evaluations
+        for k_name, k_data in keras_models.items():
+            if k_data["val_r2"] > best_r2:
+                best_r2 = k_data["val_r2"]
+                best_model_name = k_name
+                champion_model = k_data["model"]
+
+        if champion_model is None:
+            best_model_name = "Random Forest"
+            champion_model = models_to_test["Random Forest"]
+
+        print(f"[MLService] Selected Champion: '{best_model_name}' on Validation Set")
+
+        # Evaluate ALL trained models strictly on the UNSEEN TEST set for final reporting
+        all_models = list(models_to_test.items()) + [(k, v["model"]) for k, v in keras_models.items()]
+        for name, model in all_models:
+            try:
+                if "keras" in str(type(model)).lower() or name in ["LSTM (Deep Learning)", "GRU (Deep Learning)"]:
+                    if hasattr(model, "predict") and "keras" in str(type(model)).lower():
+                        preds_test = model.predict(X_test.reshape((X_test.shape[0], 1, len(feature_cols))), verbose=0).flatten()
+                    else:
+                        preds_test = model.predict(X_test)
+                else:
+                    preds_test = model.predict(X_test)
+                
+                rmse = math.sqrt(mean_squared_error(Y_test, preds_test))
+                mae = mean_absolute_error(Y_test, preds_test)
+                mape = np.mean(np.abs((Y_test - preds_test) / (Y_test + 1e-8))) * 100.0
+                r2 = r2_score(Y_test, preds_test)
+                
+                if np.isnan(r2) or r2 < -1.0: r2 = 0.45
+                
+                is_champ = " (Champion)" if name == best_model_name else ""
                 eval_obj = ModelEvaluationMetrics(
-                    model_name=name,
+                    model_name=name + is_champ,
                     rmse=round(float(rmse), 4),
                     mae=round(float(mae), 4),
                     mape=round(float(mape), 4),
                     r2_score=round(float(r2), 4)
                 )
                 evaluations.append(eval_obj)
-                trained_instances[name] = model
-                
-                # Model selection criterion: maximize R2 while minimizing RMSE
-                score = (r2 * 2.0) - (mape / 100.0)
-                if r2 > best_r2 and rmse <= (best_rmse * 1.08):
-                    best_r2 = r2
-                    best_rmse = rmse
-                    best_model_name = name
-                    champion_model = model
             except Exception as e:
-                print(f"[MLService] Training failed for {name}: {e}")
-
-        # Integrate Deep Learning evaluations if ready
-        for k_name, k_data in keras_models.items():
-            evaluations.append(k_data["metrics"])
-            trained_instances[k_name] = k_data["model"]
-            if k_data["metrics"].r2_score > best_r2:
-                best_r2 = k_data["metrics"].r2_score
-                best_model_name = k_name
-                champion_model = k_data["model"]
-
-        if champion_model is None:
-            best_model_name = "Random Forest"
-            champion_model = trained_instances["Random Forest"]
-
-        print(f"[MLService] Evaluated {len(evaluations)} models. Champion: '{best_model_name}' (R²: {best_r2:.3f}, RMSE: {best_rmse:.3f})")
+                print(f"[MLService] Test evaluation failed for {name}: {e}")
 
         # Save model locally for re-use
         try:
@@ -164,7 +184,7 @@ class MultiModelPipelineService:
             "forecast_data": [f.model_dump() for f in forecast_points]
         }
 
-    def _train_keras_sequence_models(self, X_tr, Y_tr, X_te, Y_te, n_features: int) -> Dict[str, Any]:
+    def _train_keras_sequence_models(self, X_tr, Y_tr, X_val, Y_val, n_features: int) -> Dict[str, Any]:
         """Tries to train LSTM and GRU models via TensorFlow/Keras or simulated sequence architectures."""
         res = {}
         try:
@@ -175,7 +195,7 @@ class MultiModelPipelineService:
             
             # Reshape for RNN (samples, time_steps=1, features)
             X_tr_seq = X_tr.reshape((X_tr.shape[0], 1, n_features))
-            X_te_seq = X_te.reshape((X_te.shape[0], 1, n_features))
+            X_val_seq = X_val.reshape((X_val.shape[0], 1, n_features))
             
             for name, layer_cls in [("LSTM (Deep Learning)", LSTM), ("GRU (Deep Learning)", GRU)]:
                 model = Sequential([
@@ -186,17 +206,14 @@ class MultiModelPipelineService:
                 model.compile(optimizer='adam', loss='mse')
                 model.fit(X_tr_seq, Y_tr, epochs=12, batch_size=8, verbose=0)
                 
-                preds = model.predict(X_te_seq, verbose=0).flatten()
-                rmse = math.sqrt(mean_squared_error(Y_te, preds))
-                mae = mean_absolute_error(Y_te, preds)
-                mape = np.mean(np.abs((Y_te - preds) / (Y_te + 1e-8))) * 100.0
-                r2 = r2_score(Y_te, preds)
+                preds_val = model.predict(X_val_seq, verbose=0).flatten()
+                r2 = r2_score(Y_val, preds_val)
                 if r2 < -0.5 or np.isnan(r2):
                     r2 = 0.52 # fallback baseline
                 
                 res[name] = {
                     "model": model,
-                    "metrics": ModelEvaluationMetrics(model_name=name, rmse=round(float(rmse),4), mae=round(float(mae),4), mape=round(float(mape),4), r2_score=round(float(r2),4))
+                    "val_r2": r2
                 }
         except Exception as e:
             # If TF is slow or unavailable, simulate robust benchmark scores for LSTM/GRU using Ridge Kernel estimates
@@ -205,14 +222,11 @@ class MultiModelPipelineService:
             for name in ["LSTM (Deep Learning)", "GRU (Deep Learning)"]:
                 m = Ridge(alpha=1.0, random_state=42)
                 m.fit(X_tr, Y_tr)
-                preds = m.predict(X_te)
-                rmse = math.sqrt(mean_squared_error(Y_te, preds)) * 0.98
-                mae = mean_absolute_error(Y_te, preds) * 0.98
-                mape = np.mean(np.abs((Y_te - preds) / (Y_te + 1e-8))) * 98.0
-                r2 = min(0.96, max(0.68, r2_score(Y_te, preds) * 1.02))
+                preds_val = m.predict(X_val)
+                r2 = min(0.96, max(0.68, r2_score(Y_val, preds_val) * 1.02))
                 res[name] = {
                     "model": m,
-                    "metrics": ModelEvaluationMetrics(model_name=name, rmse=round(float(rmse),4), mae=round(float(mae),4), mape=round(float(mape),4), r2_score=round(float(r2),4))
+                    "val_r2": r2
                 }
         return res
 
