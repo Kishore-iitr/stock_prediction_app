@@ -57,14 +57,9 @@ export function TickerSearchBar() {
               <span className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-mono font-bold flex items-center gap-1">
                 <ShieldCheck className="w-3 h-3 text-emerald-400" /> Professional Equities Analytics
               </span>
-              <span className="text-[11px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 font-mono">
-                OpenRouter | Conduit
-              </span>
             </div>
             <p className="text-xs text-slate-400 font-medium flex items-center gap-1.5 mt-0.5">
               <span>Auto-ARIMA & GARCH Econometric Engine</span>
-              <span>•</span>
-              <span className="text-emerald-400/90 font-mono">Optimized for high-accuracy short-term forecasting</span>
             </p>
           </div>
         </div>
